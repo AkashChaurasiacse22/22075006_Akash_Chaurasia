@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        {% comment %} {% load static %}
+        <link rel="stylesheet" href="{% static 'URL_Mapper\results_style.css' %}"> {% endcomment %}
+    </head>
+    <body>
+        <h1>URL Shortner</h1>
+        <p>Your Shorten URL is:--  <a href="search/{{ Short_url }}">{{ Short_url }}</a></p>
+        <p><a href="{% url 'URL_Mapper:shorten_url' %}">Home</a></p>
+    </body> 
+</html>

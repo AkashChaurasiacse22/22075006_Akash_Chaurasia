@@ -1,0 +1,10 @@
+*{
+    background-color:grey;
+}
+#Heading{
+    text-align:center;
+    border-color:goldenrod;
+    border-radius:20%;
+    background-color:black;
+    color:white;
+}
