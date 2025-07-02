@@ -1,105 +1,54 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:orientation="vertical"
-    android:padding="24dp"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent">
-
-    <Button
-        android:id="@+id/launchButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Launch YouTube App" />
-
-    <Button
-        android:id="@+id/screenButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
-        android:text="Get Screen Size" />
-
-    <TextView
-        android:id="@+id/resultView"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Result will appear here"
-        android:paddingTop="20dp"
-        android:textSize="16sp" />
-</LinearLayout>
-
-
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.mcpdemo">
-
-    <uses-permission android:name="android.permission.INTERNET"/>
-
-    <application
-        android:allowBackup="true"
-        android:label="MCP Demo"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
-        <activity android:name=".MainActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-
-package com.example.mcpdemo
-
-import android.os.Bundle
-import android.widget.Button
-import android.widget.TextView
-import androidx.appcompat.app.AppCompatActivity
 import okhttp3.*
 import org.json.JSONObject
 import java.io.IOException
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
 
-class MainActivity : AppCompatActivity() {
-
+object MCPClient {
     private val client = OkHttpClient()
+    private var requestId = 1
+    private const val MCP_URL = "http://10.0.2.2:8000/MCP" // Use your real IP for physical device
 
-    // Replace with your laptop IP (where MCP is running)
-    private val mcpBaseUrl = "http://192.168.1.100:3000"
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        val launchButton = findViewById<Button>(R.id.launchButton)
-        val screenButton = findViewById<Button>(R.id.screenButton)
-        val resultView = findViewById<TextView>(R.id.resultView)
-
-        launchButton.setOnClickListener {
-            callMcp("launch_app", JSONObject().put("app", "com.google.android.youtube")) {
-                runOnUiThread { resultView.text = it }
-            }
+    fun initialize() {
+        val json = JSONObject().apply {
+            put("jsonrpc", "2.0")
+            put("id", requestId++)
+            put("method", "initialize")
+            put("params", JSONObject().apply {
+                put("capabilities", listOf("tools/call"))
+                put("transport", "http")
+            })
         }
-
-        screenButton.setOnClickListener {
-            callMcp("get_screen_size", JSONObject()) {
-                runOnUiThread { resultView.text = it }
-            }
-        }
+        post(json)
     }
 
-    private fun callMcp(tool: String, params: JSONObject, callback: (String) -> Unit) {
-        val body = RequestBody.create("application/json".toMediaTypeOrNull(), params.toString())
+    fun callTool(toolName: String, args: JSONObject) {
+        val json = JSONObject().apply {
+            put("jsonrpc", "2.0")
+            put("id", requestId++)
+            put("method", "tools/call")
+            put("params", JSONObject().apply {
+                put("name", toolName)
+                put("arguments", args)
+            })
+        }
+        post(json)
+    }
+
+    private fun post(json: JSONObject) {
+        val body = RequestBody.create("application/json".toMediaTypeOrNull(), json.toString())
         val request = Request.Builder()
-            .url("$mcpBaseUrl/tools/$tool/run")
+            .url(MCP_URL)
             .post(body)
             .build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                callback("Error: ${e.message}")
+                println("Failed: ${e.message}")
             }
 
             override fun onResponse(call: Call, response: Response) {
-                callback(response.body?.string() ?: "No response")
+                response.body?.string()?.let {
+                    println("Response: $it")
+                }
             }
         })
     }
@@ -107,7 +56,20 @@ class MainActivity : AppCompatActivity() {
 
 
 
-dependencies {
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.squareup.okhttp3:okhttp:4.9.3'
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        // Initialize MCP connection
+        MCPClient.initialize()
+
+        // Call a tool after short delay
+        Handler(Looper.getMainLooper()).postDelayed({
+            val args = JSONObject().apply {
+                put("location", "New York")
+            }
+            MCPClient.callTool("weather", args)
+        }, 2000)
+    }
 }
