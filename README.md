@@ -1,75 +1,92 @@
+package com.example.test1
+
+import android.app.IntentService
+import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import org.json.JSONObject
-import java.io.IOException
 
-object MCPClient {
+class GeminiMcpLoopService : IntentService("GeminiMcpLoopService") {
+
+    private val geminiApiKey = "YOUR_GEMINI_API_KEY"
+    private val mcpUrl = "http://10.0.2.2:8000/mcp/"
     private val client = OkHttpClient()
-    private var requestId = 1
-    private const val MCP_URL = "http://10.0.2.2:8000/MCP" // Use your real IP for physical device
 
-    fun initialize() {
-        val json = JSONObject().apply {
-            put("jsonrpc", "2.0")
-            put("id", requestId++)
-            put("method", "initialize")
-            put("params", JSONObject().apply {
-                put("capabilities", listOf("tools/call"))
-                put("transport", "http")
-            })
+    override fun onHandleIntent(intent: Intent?) {
+        val initialPrompt = intent?.getStringExtra("prompt") ?: return
+
+        var currentInput = initialPrompt
+        var iteration = 0
+        var stop = false
+
+        while (!stop && iteration < 10) { // prevent infinite loop
+            iteration++
+
+            val geminiResponse = callGemini(currentInput) ?: break
+            showToast("Gemini: $geminiResponse")
+
+            // Stop if Gemini says task is completed
+            if (geminiResponse.contains("completed", ignoreCase = true)) {
+                showToast("Task completed.")
+                break
+            }
+
+            val mcpResponse = callMcp(geminiResponse) ?: break
+            showToast("MCP: $mcpResponse")
+
+            currentInput = mcpResponse // feed MCP response back to Gemini
+            Thread.sleep(1500)
         }
-        post(json)
     }
 
-    fun callTool(toolName: String, args: JSONObject) {
-        val json = JSONObject().apply {
-            put("jsonrpc", "2.0")
-            put("id", requestId++)
-            put("method", "tools/call")
-            put("params", JSONObject().apply {
-                put("name", toolName)
-                put("arguments", args)
-            })
+    private fun callGemini(prompt: String): String? {
+        return try {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=$geminiApiKey"
+            val requestBody = JSONObject().apply {
+                put("contents", listOf(JSONObject().apply {
+                    put("parts", listOf(JSONObject().apply {
+                        put("text", prompt)
+                    }))
+                }))
+            }
+            val body = RequestBody.create("application/json".toMediaTypeOrNull(), requestBody.toString())
+            val request = Request.Builder().url(url).post(body).build()
+            client.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string()
+                val json = JSONObject(responseBody ?: "")
+                json.getJSONArray("candidates")
+                    .getJSONObject(0)
+                    .getJSONObject("content")
+                    .getJSONArray("parts")
+                    .getJSONObject(0)
+                    .getString("text")
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
         }
-        post(json)
     }
 
-    private fun post(json: JSONObject) {
-        val body = RequestBody.create("application/json".toMediaTypeOrNull(), json.toString())
-        val request = Request.Builder()
-            .url(MCP_URL)
-            .post(body)
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                println("Failed: ${e.message}")
+    private fun callMcp(jsonText: String): String? {
+        return try {
+            val json = JSONObject(jsonText)
+            val body = RequestBody.create("application/json".toMediaTypeOrNull(), json.toString())
+            val request = Request.Builder().url(mcpUrl).post(body).build()
+            client.newCall(request).execute().use { response ->
+                response.body?.string()
             }
-
-            override fun onResponse(call: Call, response: Response) {
-                response.body?.string()?.let {
-                    println("Response: $it")
-                }
-            }
-        })
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
-}
 
-
-
-class MainActivity : AppCompatActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        // Initialize MCP connection
-        MCPClient.initialize()
-
-        // Call a tool after short delay
-        Handler(Looper.getMainLooper()).postDelayed({
-            val args = JSONObject().apply {
-                put("location", "New York")
-            }
-            MCPClient.callTool("weather", args)
-        }, 2000)
+    private fun showToast(text: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(applicationContext, text.take(500), Toast.LENGTH_LONG).show()
+        }
     }
 }
