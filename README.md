@@ -1,92 +1,134 @@
 package com.example.test1
 
-import android.app.IntentService
+import android.app.Service
 import android.content.Intent
-import android.os.Handler
-import android.os.Looper
-import android.widget.Toast
+import android.os.IBinder
+import android.util.Log
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
-class GeminiMcpLoopService : IntentService("GeminiMcpLoopService") {
+class MCPService : Service() {
 
-    private val geminiApiKey = "YOUR_GEMINI_API_KEY"
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
+
+    private val executor = Executors.newSingleThreadExecutor()
     private val mcpUrl = "http://10.0.2.2:8000/mcp/"
-    private val client = OkHttpClient()
 
-    override fun onHandleIntent(intent: Intent?) {
-        val initialPrompt = intent?.getStringExtra("prompt") ?: return
+    private var currentRequestId: String = ""
+    private var currentCall: Call? = null
 
-        var currentInput = initialPrompt
-        var iteration = 0
-        var stop = false
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        sendJsonRequestThenListen()
+        return START_STICKY
+    }
 
-        while (!stop && iteration < 10) { // prevent infinite loop
-            iteration++
+    private fun sendJsonRequestThenListen() {
+        currentRequestId = UUID.randomUUID().toString()
 
-            val geminiResponse = callGemini(currentInput) ?: break
-            showToast("Gemini: $geminiResponse")
+        val jsonRequest = JSONObject().apply {
+            put("jsonrpc", "2.0")
+            put("id", currentRequestId)
+            put("method", "tools/list")
+            put("params", JSONObject())
+        }
 
-            // Stop if Gemini says task is completed
-            if (geminiResponse.contains("completed", ignoreCase = true)) {
-                showToast("Task completed.")
-                break
+        val requestBody = RequestBody.create(
+            "application/json".toMediaTypeOrNull(),
+            jsonRequest.toString()
+        )
+
+        val postRequest = Request.Builder()
+            .url(mcpUrl)
+            .post(requestBody)
+            .build()
+
+        client.newCall(postRequest).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.e("MCPService", "POST request failed: ${e.message}")
             }
 
-            val mcpResponse = callMcp(geminiResponse) ?: break
-            showToast("MCP: $mcpResponse")
+            override fun onResponse(call: Call, response: Response) {
+                if (response.isSuccessful) {
+                    Log.d("MCPService", "POST succeeded with id: $currentRequestId")
+                    // Cancel any previous SSE listener
+                    currentCall?.cancel()
+                    listenToSSE(currentRequestId)
+                } else {
+                    Log.e("MCPService", "POST request error: ${response.code}")
+                }
+            }
+        })
+    }
 
-            currentInput = mcpResponse // feed MCP response back to Gemini
-            Thread.sleep(1500)
+    private fun listenToSSE(requestId: String) {
+        val getRequest = Request.Builder()
+            .url(mcpUrl)
+            .get()
+            .build()
+
+        executor.execute {
+            try {
+                val call = client.newCall(getRequest)
+                currentCall = call
+
+                call.execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.e("MCPService", "SSE connection failed: $response")
+                        return@execute
+                    }
+
+                    val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+                    var line: String?
+                    var event: String? = null
+                    val dataBuilder = StringBuilder()
+
+                    while (reader.readLine().also { line = it } != null && !call.isCanceled()) {
+                        line = line?.trim()
+
+                        if (line!!.startsWith("event:")) {
+                            event = line!!.removePrefix("event:").trim()
+                        } else if (line!!.startsWith("data:")) {
+                            dataBuilder.append(line!!.removePrefix("data:").trim())
+                        } else if (line!!.isEmpty()) {
+                            val fullData = dataBuilder.toString()
+                            if (event != null && fullData.isNotEmpty()) {
+                                val json = JSONObject(fullData)
+                                val incomingId = json.optString("id", "")
+
+                                if (incomingId == requestId) {
+                                    Log.i("MCPService", "✅ SSE matched [$event]: $fullData")
+                                    // Optional: stop listening after matching event
+                                    call.cancel()
+                                } else {
+                                    Log.i("MCPService", "❌ SSE ignored id=$incomingId (expected $requestId)")
+                                }
+                            }
+                            // Reset
+                            event = null
+                            dataBuilder.setLength(0)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("MCPService", "SSE Error: ${e.message}")
+            }
         }
     }
 
-    private fun callGemini(prompt: String): String? {
-        return try {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=$geminiApiKey"
-            val requestBody = JSONObject().apply {
-                put("contents", listOf(JSONObject().apply {
-                    put("parts", listOf(JSONObject().apply {
-                        put("text", prompt)
-                    }))
-                }))
-            }
-            val body = RequestBody.create("application/json".toMediaTypeOrNull(), requestBody.toString())
-            val request = Request.Builder().url(url).post(body).build()
-            client.newCall(request).execute().use { response ->
-                val responseBody = response.body?.string()
-                val json = JSONObject(responseBody ?: "")
-                json.getJSONArray("candidates")
-                    .getJSONObject(0)
-                    .getJSONObject("content")
-                    .getJSONArray("parts")
-                    .getJSONObject(0)
-                    .getString("text")
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        }
+    override fun onDestroy() {
+        currentCall?.cancel()
+        executor.shutdownNow()
+        super.onDestroy()
     }
 
-    private fun callMcp(jsonText: String): String? {
-        return try {
-            val json = JSONObject(jsonText)
-            val body = RequestBody.create("application/json".toMediaTypeOrNull(), json.toString())
-            val request = Request.Builder().url(mcpUrl).post(body).build()
-            client.newCall(request).execute().use { response ->
-                response.body?.string()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        }
-    }
-
-    private fun showToast(text: String) {
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(applicationContext, text.take(500), Toast.LENGTH_LONG).show()
-        }
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 }
