@@ -1,107 +1,99 @@
-package com.example.test1
+package com.example.sseclient
 
-import android.app.Service
-import android.content.Intent
-import android.os.IBinder
+import android.os.Bundle
 import android.util.Log
+import androidx.appcompat.app.AppCompatActivity
+import com.example.sseclient.databinding.ActivityMainBinding
+import com.launchdarkly.eventsource.EventHandler
+import com.launchdarkly.eventsource.EventSource
+import com.launchdarkly.eventsource.MessageEvent
 import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.sse.EventSource
-import okhttp3.sse.EventSourceListener
-import okhttp3.sse.EventSources
-import org.json.JSONObject
-import java.util.*
+import java.net.URI
+import java.util.concurrent.TimeUnit
 
-class MCPService : Service() {
+class MainActivity : AppCompatActivity() {
+    private lateinit var binding: ActivityMainBinding
+    private val TAG = "SSEClient"
 
-    private val TAG = "MCPService"
-    private val mcpUrl = "http://10.0.2.2:8000/mcp/"
-    private val client = OkHttpClient.Builder().build()
-    private var eventSource: EventSource? = null
-    private val pendingIds = Collections.synchronizedSet(mutableSetOf<String>())
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        connectSSE()
-        // Example POST; call this anytime you need a request
-        sendJsonRpc("tools/list", JSONObject())
-        return START_STICKY
-    }
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
 
-    /** 1️⃣ Open SSE stream once and keep alive */
-    private fun connectSSE() {
-        if (eventSource != null) return
-
-        val request = Request.Builder()
-            .url(mcpUrl)
-            .header("Accept", "text/event-stream")
-            .build()
-
-        eventSource = EventSources.createFactory(client).newEventSource(request, object : EventSourceListener() {
-            override fun onOpen(es: EventSource, response: Response) {
-                Log.d(TAG, "SSE connected")
-            }
-            override fun onEvent(es: EventSource, id: String?, type: String?, data: String) {
-                Log.d(TAG, "SSE got data: $data")
-                try {
-                    val json = JSONObject(data)
-                    val respId = json.optString("id")
-                    if (pendingIds.contains(respId)) {
-                        Log.i(TAG, "✅ Matched id=$respId: $data")
-                        pendingIds.remove(respId)
-                        // TODO: process your result
-                    } else {
-                        Log.d(TAG, "Ignored id=$respId")
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Invalid SSE data", e)
-                }
-            }
-            override fun onFailure(es: EventSource, t: Throwable?, resp: Response?) {
-                Log.e(TAG, "SSE failed", t)
-                eventSource = null
-                // optionally reconnect
-            }
-            override fun onClosed(es: EventSource) {
-                Log.d(TAG, "SSE closed")
-                eventSource = null
-            }
-        })
-    }
-
-    /** 2️⃣ Send JSON-RPC via POST; response will come over SSE */
-    private fun sendJsonRpc(method: String, params: JSONObject) {
-        val id = UUID.randomUUID().toString()
-        pendingIds.add(id)
-
-        val json = JSONObject().apply {
-            put("jsonrpc", "2.0")
-            put("id", id)
-            put("method", method)
-            put("params", params)
+        binding.startStreamBtn.setOnClickListener {
+            startStreaming()
         }
-        val body = json.toString().toRequestBody("application/json".toMediaTypeOrNull())
+    }
+
+    private fun startStreaming() {
+        // Simulated: Send POST with JSON
+        val json = """
+            {
+                "user_id": "123",
+                "filter": "realtime"
+            }
+        """.trimIndent()
+
+        val requestBody = RequestBody.create("application/json".toMediaTypeOrNull(), json)
+        val client = OkHttpClient()
+
         val request = Request.Builder()
-            .url(mcpUrl)
-            .post(body)
+            .url("https://your-sse-server.com/start-stream") // Replace with actual
+            .post(requestBody)
             .build()
 
         client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(c: Call, e: java.io.IOException) {
-                pendingIds.remove(id)
-                Log.e(TAG, "POST failed for id=$id", e)
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                Log.e(TAG, "Failed to start stream: ${e.message}")
             }
-            override fun onResponse(c: Call, resp: Response) {
-                Log.d(TAG, "POST sent id=$id, HTTP ${resp.code}")
-                resp.close()
+
+            override fun onResponse(call: Call, response: Response) {
+                if (response.isSuccessful) {
+                    // Here assume the server returns the stream URL as plain text
+                    val streamUrl = response.body?.string()?.trim() ?: return
+                    connectToSSE(streamUrl)
+                } else {
+                    Log.e(TAG, "Start stream failed: ${response.code}")
+                }
             }
         })
     }
 
-    override fun onDestroy() {
-        eventSource?.cancel()
-        super.onDestroy()
-    }
+    private fun connectToSSE(url: String) {
+        val client = OkHttpClient.Builder()
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .build()
 
-    override fun onBind(intent: Intent?): IBinder? = null
+        val handler = object : EventHandler {
+            override fun onOpen() {
+                runOnUiThread {
+                    binding.streamTextView.append("\n[Stream Opened]\n")
+                }
+            }
+
+            override fun onClosed() {
+                runOnUiThread {
+                    binding.streamTextView.append("\n[Stream Closed]\n")
+                }
+            }
+
+            override fun onMessage(event: String?, messageEvent: MessageEvent) {
+                runOnUiThread {
+                    binding.streamTextView.append("\nMessage: ${messageEvent.data}")
+                }
+            }
+
+            override fun onComment(comment: String?) {}
+            override fun onError(t: Throwable?) {
+                Log.e(TAG, "SSE error: ${t?.message}")
+            }
+        }
+
+        val eventSource = EventSource.Builder(handler, URI.create(url))
+            .client(client)
+            .build()
+
+        eventSource.start()
+    }
 }
