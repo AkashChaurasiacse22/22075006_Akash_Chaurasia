@@ -16,95 +16,86 @@ import java.util.*
 class MCPService : Service() {
 
     private val TAG = "MCPService"
-    private val client = OkHttpClient.Builder().build()
     private val mcpUrl = "http://10.0.2.2:8000/mcp/"
-
-    private var currentRequestId = ""
+    private val client = OkHttpClient.Builder().build()
     private var eventSource: EventSource? = null
+    private val pendingIds = Collections.synchronizedSet(mutableSetOf<String>())
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Only start SSE once
-        if (eventSource == null) {
-            startSSEListener()
-        }
-
-        // You can trigger RPC here or from UI
-        triggerToolsListRpc()
-
+        connectSSE()
+        // Example POST; call this anytime you need a request
+        sendJsonRpc("tools/list", JSONObject())
         return START_STICKY
     }
 
-    private fun triggerToolsListRpc() {
-        currentRequestId = UUID.randomUUID().toString()
+    /** 1️⃣ Open SSE stream once and keep alive */
+    private fun connectSSE() {
+        if (eventSource != null) return
+
+        val request = Request.Builder()
+            .url(mcpUrl)
+            .header("Accept", "text/event-stream")
+            .build()
+
+        eventSource = EventSources.createFactory(client).newEventSource(request, object : EventSourceListener() {
+            override fun onOpen(es: EventSource, response: Response) {
+                Log.d(TAG, "SSE connected")
+            }
+            override fun onEvent(es: EventSource, id: String?, type: String?, data: String) {
+                Log.d(TAG, "SSE got data: $data")
+                try {
+                    val json = JSONObject(data)
+                    val respId = json.optString("id")
+                    if (pendingIds.contains(respId)) {
+                        Log.i(TAG, "✅ Matched id=$respId: $data")
+                        pendingIds.remove(respId)
+                        // TODO: process your result
+                    } else {
+                        Log.d(TAG, "Ignored id=$respId")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Invalid SSE data", e)
+                }
+            }
+            override fun onFailure(es: EventSource, t: Throwable?, resp: Response?) {
+                Log.e(TAG, "SSE failed", t)
+                eventSource = null
+                // optionally reconnect
+            }
+            override fun onClosed(es: EventSource) {
+                Log.d(TAG, "SSE closed")
+                eventSource = null
+            }
+        })
+    }
+
+    /** 2️⃣ Send JSON-RPC via POST; response will come over SSE */
+    private fun sendJsonRpc(method: String, params: JSONObject) {
+        val id = UUID.randomUUID().toString()
+        pendingIds.add(id)
 
         val json = JSONObject().apply {
             put("jsonrpc", "2.0")
-            put("id", currentRequestId)
-            put("method", "tools/list")
-            put("params", JSONObject())
+            put("id", id)
+            put("method", method)
+            put("params", params)
         }
-
         val body = json.toString().toRequestBody("application/json".toMediaTypeOrNull())
-
         val request = Request.Builder()
             .url(mcpUrl)
             .post(body)
             .build()
 
         client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: java.io.IOException) {
-                Log.e(TAG, "❌ JSON-RPC POST failed: ${e.message}")
+            override fun onFailure(c: Call, e: java.io.IOException) {
+                pendingIds.remove(id)
+                Log.e(TAG, "POST failed for id=$id", e)
             }
-
-            override fun onResponse(call: Call, response: Response) {
-                Log.d(TAG, "✅ RPC sent with id=$currentRequestId, HTTP ${response.code}")
-                response.close()
+            override fun onResponse(c: Call, resp: Response) {
+                Log.d(TAG, "POST sent id=$id, HTTP ${resp.code}")
+                resp.close()
             }
         })
-    }
-
-    private fun startSSEListener() {
-        val request = Request.Builder()
-            .url(mcpUrl)
-            .addHeader("Accept", "text/event-stream")
-            .build()
-
-        eventSource = EventSources.createFactory(client)
-            .newEventSource(request, object : EventSourceListener() {
-
-                override fun onOpen(eventSource: EventSource, response: Response) {
-                    Log.d(TAG, "🔗 SSE connection established")
-                }
-
-                override fun onEvent(
-                    eventSource: EventSource,
-                    id: String?,
-                    type: String?,
-                    data: String
-                ) {
-                    Log.d(TAG, "📥 SSE event: $data")
-                    try {
-                        val json = JSONObject(data)
-                        val responseId = json.optString("id", "")
-                        if (responseId == currentRequestId) {
-                            Log.i(TAG, "✅ Received expected response for ID=$responseId")
-                            // Process your successful result here
-                        } else {
-                            Log.d(TAG, "ℹ️ Ignored unrelated SSE message with ID=$responseId")
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "❌ Failed to parse SSE data: ${e.message}")
-                    }
-                }
-
-                override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                    Log.e(TAG, "❌ SSE connection failed: ${t?.message}")
-                }
-
-                override fun onClosed(eventSource: EventSource) {
-                    Log.d(TAG, "🔒 SSE connection closed")
-                }
-            })
     }
 
     override fun onDestroy() {
