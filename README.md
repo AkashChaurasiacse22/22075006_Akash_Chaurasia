@@ -22,9 +22,8 @@ class MCPService : Service() {
 
     private val executor = Executors.newSingleThreadExecutor()
     private val mcpUrl = "http://10.0.2.2:8000/mcp/"
-
-    private var currentRequestId: String = ""
     private var currentCall: Call? = null
+    private var currentRequestId = ""
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         sendJsonRequestThenListen()
@@ -58,12 +57,16 @@ class MCPService : Service() {
 
             override fun onResponse(call: Call, response: Response) {
                 if (response.isSuccessful) {
-                    Log.d("MCPService", "POST succeeded with id: $currentRequestId")
-                    // Cancel any previous SSE listener
-                    currentCall?.cancel()
-                    listenToSSE(currentRequestId)
+                    Log.d("MCPService", "✅ POST succeeded for id=$currentRequestId")
+
+                    // Slight delay to allow server to prepare the SSE buffer
+                    executor.execute {
+                        Thread.sleep(500) // Delay to let server write response
+                        currentCall?.cancel()
+                        listenToSSE(currentRequestId)
+                    }
                 } else {
-                    Log.e("MCPService", "POST request error: ${response.code}")
+                    Log.e("MCPService", "❌ POST failed with code ${response.code}")
                 }
             }
         })
@@ -75,14 +78,14 @@ class MCPService : Service() {
             .get()
             .build()
 
+        val call = client.newCall(getRequest)
+        currentCall = call
+
         executor.execute {
             try {
-                val call = client.newCall(getRequest)
-                currentCall = call
-
                 call.execute().use { response ->
                     if (!response.isSuccessful) {
-                        Log.e("MCPService", "SSE connection failed: $response")
+                        Log.e("MCPService", "SSE connection failed: ${response.code}")
                         return@execute
                     }
 
@@ -92,34 +95,38 @@ class MCPService : Service() {
                     val dataBuilder = StringBuilder()
 
                     while (reader.readLine().also { line = it } != null && !call.isCanceled()) {
-                        line = line?.trim()
-
-                        if (line!!.startsWith("event:")) {
-                            event = line!!.removePrefix("event:").trim()
-                        } else if (line!!.startsWith("data:")) {
-                            dataBuilder.append(line!!.removePrefix("data:").trim())
-                        } else if (line!!.isEmpty()) {
-                            val fullData = dataBuilder.toString()
-                            if (event != null && fullData.isNotEmpty()) {
-                                val json = JSONObject(fullData)
-                                val incomingId = json.optString("id", "")
-
-                                if (incomingId == requestId) {
-                                    Log.i("MCPService", "✅ SSE matched [$event]: $fullData")
-                                    // Optional: stop listening after matching event
-                                    call.cancel()
-                                } else {
-                                    Log.i("MCPService", "❌ SSE ignored id=$incomingId (expected $requestId)")
-                                }
+                        val trimmedLine = line!!.trim()
+                        when {
+                            trimmedLine.startsWith("event:") -> {
+                                event = trimmedLine.removePrefix("event:").trim()
                             }
-                            // Reset
-                            event = null
-                            dataBuilder.setLength(0)
+                            trimmedLine.startsWith("data:") -> {
+                                dataBuilder.append(trimmedLine.removePrefix("data:").trim())
+                            }
+                            trimmedLine.isEmpty() -> {
+                                val fullData = dataBuilder.toString()
+                                if (fullData.isNotEmpty() && event != null) {
+                                    val json = JSONObject(fullData)
+                                    val incomingId = json.optString("id", "")
+
+                                    if (incomingId == requestId) {
+                                        Log.i("MCPService", "✅ Matched SSE [$event] for id=$incomingId: $fullData")
+                                        // TODO: Handle the correct SSE response here
+                                        call.cancel() // stop reading more after matched one
+                                    } else {
+                                        Log.i("MCPService", "🔁 Ignored SSE [$event] for id=$incomingId (expected $requestId)")
+                                    }
+                                }
+                                event = null
+                                dataBuilder.setLength(0)
+                            }
                         }
                     }
                 }
             } catch (e: Exception) {
-                Log.e("MCPService", "SSE Error: ${e.message}")
+                if (!call.isCanceled()) {
+                    Log.e("MCPService", "SSE error: ${e.message}")
+                }
             }
         }
     }
