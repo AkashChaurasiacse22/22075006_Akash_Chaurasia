@@ -4,10 +4,8 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
@@ -20,48 +18,62 @@ class MCPService : Service() {
 
   private val client = OkHttpClient.Builder()
     .connectTimeout(5, TimeUnit.SECONDS)
-    .readTimeout(0, TimeUnit.MILLISECONDS) // keep-alive for SSE
+    .readTimeout(0, TimeUnit.MILLISECONDS)
     .build()
 
   private val mcpUrl = "http://10.0.2.2:8000/mcp/"
-  private var eventSource: EventSource? = null
   private var rpcRequestId = ""
+  private var eventSource: EventSource? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    sendRpcThenOpenSse()
+    sendRpcAndPrimeSse()
     return START_STICKY
   }
 
-  private fun sendRpcThenOpenSse() {
-    // 1) Generate a unique JSON-RPC id
+  private fun sendRpcAndPrimeSse() {
     rpcRequestId = UUID.randomUUID().toString()
-
-    // 2) Build and send JSON-RPC POST
-    val rpc = JSONObject().apply {
+    val rpcJson = JSONObject().apply {
       put("jsonrpc", "2.0")
       put("id", rpcRequestId)
       put("method", "tools/list")
       put("params", JSONObject())
     }
-    val body = RequestBody.create("application/json".toMediaTypeOrNull(), rpc.toString())
+    val body = RequestBody.create("application/json".toMediaTypeOrNull(), rpcJson.toString())
+
+    // 1) send the JSON‑RPC POST
     client.newCall(Request.Builder()
         .url(mcpUrl)
         .post(body)
         .build()
-    ).enqueue(object : okhttp3.Callback {
-      override fun onFailure(call: okhttp3.Call, e: IOException) {
+    ).enqueue(object : Callback {
+      override fun onFailure(call: Call, e: IOException) {
         Log.e("MCPService", "RPC POST failed: ${e.message}")
       }
-      override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-        response.close()
-        Log.d("MCPService", "RPC sent, id=$rpcRequestId → opening SSE…")
-        startSseListener()
+      override fun onResponse(call: Call, resp: Response) {
+        resp.close()
+        Log.d("MCPService", "RPC sent (id=$rpcRequestId). Priming SSE…")
+
+        // 2) fire a plain GET to clear any old SSE backlog
+        client.newCall(Request.Builder()
+            .url(mcpUrl)
+            .get()
+            .build()
+        ).enqueue(object : Callback {
+          override fun onFailure(call: Call, e: IOException) {
+            Log.e("MCPService", "Prime GET failed: ${e.message}")
+          }
+          override fun onResponse(call: Call, primeResp: Response) {
+            primeResp.close()
+            Log.d("MCPService", "Prime GET done. Now opening SSE.")
+            startSseListener()
+          }
+        })
       }
     })
   }
 
   private fun startSseListener() {
-    // If an existing EventSource is open, close it
+    // close any old stream
     eventSource?.cancel()
 
     val request = Request.Builder()
@@ -69,48 +81,30 @@ class MCPService : Service() {
       .header("Accept", "text/event-stream")
       .build()
 
-    // 3) Create a proper EventSource
     eventSource = EventSources.createFactory(client)
       .newEventSource(request, object : EventSourceListener() {
-        override fun onOpen(source: EventSource, response: okhttp3.Response) {
-          Log.d("MCPService", "SSE connection opened")
+        override fun onOpen(source: EventSource, response: Response) {
+          Log.d("MCPService", "SSE opened")
         }
-
-        override fun onEvent(
-          source: EventSource,
-          id: String?,
-          type: String?,
-          data: String
-        ) {
-          // Called **only** for each new incoming SSE event
-          Log.v("MCPService", "SSE event id=$id type=$type data=$data")
-
-          // Try to parse JSON-RPC response
+        override fun onEvent(source: EventSource, id: String?, type: String?, data: String) {
+          Log.v("MCPService", "SSE → id=$id type=$type data=$data")
           try {
-            val json = JSONObject(data)
-            if (json.optString("id") == rpcRequestId) {
-              Log.i("MCPService", "✅ Matched RPC result: $data")
-              // TODO: Handle your result here
-              // If you only want one response, cancel the stream:
-              source.cancel()
+            val js = JSONObject(data)
+            if (js.optString("id") == rpcRequestId) {
+              Log.i("MCPService", "✅ Got matching result: $data")
+              source.cancel() // stop further reading
             } else {
-              Log.d("MCPService", "Ignored SSE (wrong RPC id)")
+              Log.d("MCPService", "Ignored event for id=${js.optString("id")}")
             }
           } catch (e: Exception) {
             Log.w("MCPService", "Non‑JSON SSE payload: $data")
           }
         }
-
         override fun onClosed(source: EventSource) {
-          Log.d("MCPService", "SSE connection closed")
+          Log.d("MCPService", "SSE closed")
         }
-
-        override fun onFailure(
-          source: EventSource,
-          t: Throwable?,
-          response: okhttp3.Response?
-        ) {
-          Log.e("MCPService", "SSE failure: ${t?.message}")
+        override fun onFailure(source: EventSource, t: Throwable?, response: Response?) {
+          Log.e("MCPService", "SSE failed: ${t?.message}")
           source.cancel()
         }
       })
